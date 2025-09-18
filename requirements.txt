@@ -3,8 +3,7 @@ pandas
 openpyxl
 cloudinary
 python-dotenv
-rembg
 Pillow
 requests
+rembg
 onnxruntime
-
