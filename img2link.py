@@ -8,6 +8,9 @@ import streamlit as st
 import pandas as pd
 import cloudinary
 import cloudinary.uploader
+import requests
+from rembg import remove as rembg_remove
+from PIL import Image
 
 # ---------------------------------------------------------
 # Setup
@@ -93,7 +96,7 @@ def auto_detect_columns(df: pd.DataFrame,
         raise ValueError(f"Auto-detect failed. Headers: {headers}")
     return n_idx, i_idx
 
-# ------------- Robust XLSX image mapping via drawing XML -------------
+# ------------- XLSX drawing XML mapping -------------
 NS_R   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
 NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
 NS_A   = "http://schemas.openxmlformats.org/drawingml/2006/main"
@@ -125,7 +128,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
                 if tgt: sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
                 break
         if not sheet_path: return mapping
-
         srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
         drawing_target = None
         for _, t in srels.items():
@@ -162,7 +164,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
             media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
             if not media_path.startswith("xl/"):
                 media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
-
             try:
                 data = z.read(media_path)
             except KeyError:
@@ -224,9 +225,9 @@ def embedded_images_by_row_anycol(xlsx_bytes: bytes, sheet_name: str) -> Dict[in
 # ---------------------- CSV helper (robust) ----------------------
 def read_csv_safely(uploaded_file, enc_choice: str, delim_choice: str):
     raw = uploaded_file.getvalue()
-    # 1) encodings
+    # encodings
     enc_candidates = ["utf-8-sig", "utf-8", "cp1252", "latin1"] if enc_choice == "auto" else [enc_choice]
-    # 2) delimiter
+    # delimiter
     if delim_choice == "auto":
         try:
             sample = raw[:4096].decode("utf-8", errors="ignore")
@@ -250,13 +251,46 @@ def read_csv_safely(uploaded_file, enc_choice: str, delim_choice: str):
                 continue
     raise last_err or RuntimeError("Failed to parse CSV with given options.")
 
+# ---------------------- Background processing ----------------------
+def process_image_bytes(data: bytes, mode: str) -> Tuple[bytes, str]:
+    """
+    mode: 'none' | 'remove' | 'white'
+    returns: (image_bytes, suggested_extension)
+    """
+    if mode == "none":
+        return data, ".jpg"  # default
+    try:
+        # remove background -> PNG with alpha
+        out = rembg_remove(data)  # bytes (PNG)
+        if mode == "remove":
+            return out, ".png"
+        # flatten onto white -> JPG
+        img = Image.open(io.BytesIO(out)).convert("RGBA")
+        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
+        bg.paste(img, mask=img.split()[-1])
+        buf = io.BytesIO()
+        bg.convert("RGB").save(buf, format="JPEG", quality=95)
+        return buf.getvalue(), ".jpg"
+    except Exception:
+        # If anything fails, fall back to original
+        return data, ".jpg"
+
+def get_bytes_from_url(url: str) -> Optional[bytes]:
+    try:
+        r = requests.get(url, timeout=20)
+        if r.ok:
+            return r.content
+    except Exception:
+        pass
+    return None
+
 # ---------------------------------------------------------
 # UI
 # ---------------------------------------------------------
 st.title("🔗 Image → Link Converter (Cloudinary)")
 st.markdown(
     "- **XLSX**: supports embedded pictures (inserted over cells)\n"
-    "- **CSV**: image column must contain **URLs** (web apps cannot read your local `C:\\...jpg` paths)\n"
+    "- **CSV**: image column must contain **URLs**. If you choose a background option, URLs will be downloaded, processed, and re-uploaded.\n"
     "- Links are public (unlisted) on Cloudinary"
 )
 
@@ -268,6 +302,17 @@ if not uploaded:
 
 suffix = Path(uploaded.name).suffix.lower()
 
+# Global background option
+bg_mode = st.selectbox(
+    "Background",
+    ["No change", "Remove background (transparent PNG)", "Set white background (JPG)"],
+    index=0
+)
+bg_key = {0: "none", 1: "remove", 2: "white"}[st.session_state.get('_last_bg', 0)]
+# store for next interaction
+st.session_state['_last_bg'] = ["No change","Remove background (transparent PNG)","Set white background (JPG)"].index(bg_mode)
+bg_mode = {"No change":"none", "Remove background (transparent PNG)":"remove", "Set white background (JPG)":"white"}[bg_mode]
+
 # ------------------------- XLSX -------------------------
 if suffix == ".xlsx":
     data = uploaded.getvalue()
@@ -277,7 +322,6 @@ if suffix == ".xlsx":
     headers = [str(c) for c in df.columns]
     st.write("Detected headers:", headers)
 
-    # Controls
     auto = st.checkbox("Auto-detect columns", value=False)
 
     i_idx_input = st.number_input(
@@ -317,17 +361,30 @@ if suffix == ".xlsx":
             img_txt = str(df.iat[r, i_idx] or "").strip()
             excel_row_1b = header_row + r
 
+            # embedded picture for that row?
             emb_name, emb_bytes = embedded.get(excel_row_1b, (None, None))
 
-            url = extract_url_from_cell(img_txt)
-            if url:
-                link = url
+            # priority: if there's a URL in the cell, optionally download/process; else use embedded
+            url_in_cell = extract_url_from_cell(img_txt)
+
+            if url_in_cell and bg_mode != "none":
+                raw = get_bytes_from_url(url_in_cell)
+                if raw:
+                    processed, ext = process_image_bytes(raw, bg_mode)
+                    fname = clean_filename(product or Path("image").stem) + ext
+                    link = upload_bytes_to_cloudinary(processed, fname)
+                else:
+                    link = url_in_cell  # fallback
+            elif url_in_cell:
+                link = url_in_cell
             elif emb_bytes:
-                ext = Path(emb_name or "image.png").suffix or ".png"
-                fname = clean_filename(product or Path(emb_name or "image").stem) + ext
-                link = upload_bytes_to_cloudinary(emb_bytes, fname)
+                processed, ext = process_image_bytes(emb_bytes, bg_mode)
+                # if mode is none, ext might be .jpg; if remove -> .png; if white -> .jpg
+                base = Path(emb_name or "image").stem
+                fname = clean_filename(product or base) + ext
+                link = upload_bytes_to_cloudinary(processed, fname)
             else:
-                link = ""  # keep alignment; no shifting
+                link = ""  # keep alignment
 
             links.append(link)
             prog.progress(int((r+1)/len(df)*100))
@@ -371,7 +428,7 @@ else:
         value=0 if auto else min(2, len(headers))
     )
     i_idx_input = st.number_input(
-        "Image column (1-based, must be URLs; 0 = auto)", min_value=0, max_value=len(headers),
+        "Image column (1-based, should be URLs; 0 = auto)", min_value=0, max_value=len(headers),
         value=0 if auto else min(1, len(headers))
     )
     n_idx = (n_idx_input - 1) if n_idx_input > 0 else None
@@ -381,7 +438,7 @@ else:
         if n_idx is None: n_idx = n_auto
         if i_idx is None: i_idx = i_auto
 
-    st.info("For CSV: the image column must be **URLs**; a web app cannot read local file paths.")
+    st.info("For CSV: the image column should be **URLs**. If you choose a background option above, each URL will be downloaded, processed, and re-uploaded to Cloudinary.")
 
     if st.button("Convert"):
         links = []
@@ -390,7 +447,19 @@ else:
             product = str(row[n_idx] or "").strip()
             img_txt = str(row[i_idx] or "").strip()
             url = extract_url_from_cell(img_txt)
-            links.append(url or "")
+
+            if url and bg_mode != "none":
+                raw = get_bytes_from_url(url)
+                if raw:
+                    processed, ext = process_image_bytes(raw, bg_mode)
+                    fname = clean_filename(product or Path("image").stem) + ext
+                    link = upload_bytes_to_cloudinary(processed, fname)
+                else:
+                    link = url  # fallback
+            else:
+                link = url or ""
+
+            links.append(link)
             prog.progress(int(r/len(df)*100))
 
         df.insert(i_idx + 1, "Image Link", links)
