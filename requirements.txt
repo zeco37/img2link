@@ -6,3 +6,5 @@ python-dotenv
 rembg
 Pillow
 requests
+onnxruntime
+
