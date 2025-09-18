@@ -3,4 +3,6 @@ pandas
 openpyxl
 cloudinary
 python-dotenv
-rich
+rembg
+Pillow
+requests
