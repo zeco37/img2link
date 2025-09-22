@@ -111,7 +111,6 @@ def _rels_map(z: zipfile.ZipFile, rels_path: str) -> Dict[str,str]:
     return m
 
 def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col_idx_1b: int) -> Dict[int, Tuple[str, bytes]]:
-    """Strict: only pictures whose top-left anchor is in the selected column."""
     mapping: Dict[int, Tuple[str, bytes]] = {}
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
         wb = _et_from_zip(z, "xl/workbook.xml")
@@ -125,7 +124,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
                 if tgt: sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
                 break
         if not sheet_path: return mapping
-
         srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
         drawing_target = None
         for _, t in srels.items():
@@ -135,11 +133,9 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
         if not drawing_target: return mapping
         if not drawing_target.startswith("xl/"):
             drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
-
         dr = _et_from_zip(z, drawing_target)
         if dr is None: return mapping
         drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
-
         anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
         for a in anchors:
             frm = a.find(f"{{{NS_XDR}}}from")
@@ -149,7 +145,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
             col_1b = int(c.text) + 1
             row_1b = int(r.text) + 1
             if col_1b != image_col_idx_1b: continue
-
             pic = a.find(f"{{{NS_XDR}}}pic")
             if pic is None: continue
             blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip")
@@ -158,7 +153,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
             if not rid: continue
             tgt = drrels.get(rid)
             if not tgt: continue
-
             media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
             if not media_path.startswith("xl/"):
                 media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
@@ -170,7 +164,6 @@ def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col
     return mapping
 
 def embedded_images_by_row_anycol(xlsx_bytes: bytes, sheet_name: str) -> Dict[int, Tuple[str, bytes]]:
-    """Any picture on the row counts (ignores column)."""
     mapping: Dict[int, Tuple[str, bytes]] = {}
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
         wb = _et_from_zip(z, "xl/workbook.xml")
@@ -228,19 +221,14 @@ def embedded_images_by_row_smart(
     data_end_1b: int,
     prefer_col_1b: Optional[int]
 ) -> Dict[int, Tuple[str, bytes]]:
-    """
-    Snap each image to the nearest data row using its vertical center.
-    If multiple images snap to the same row, keep the one closest to prefer_col_1b (if provided).
-    """
+    """Snap image to nearest data row using its vertical center; prefer a column if provided."""
     out: Dict[int, Tuple[str, bytes]] = {}
-    tmp: Dict[int, Tuple[str, bytes, int]] = {}  # row -> (name, bytes, center_col)
-
+    tmp: Dict[int, Tuple[str, bytes, int]] = {}
     with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
         wb = _et_from_zip(z, "xl/workbook.xml")
         if wb is None: return out
         wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
 
-        # sheet path
         sheet_path = None
         for s in wb.findall("{*}sheets/{*}sheet"):
             if s.attrib.get("name") == sheet_name:
@@ -250,7 +238,6 @@ def embedded_images_by_row_smart(
                 break
         if not sheet_path: return out
 
-        # drawing path
         srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
         drawing_target = None
         for _, t in srels.items():
@@ -300,7 +287,6 @@ def embedded_images_by_row_smart(
             except KeyError:
                 continue
 
-            # pick best per row (closest to preferred col)
             if snap_row_1b not in tmp:
                 tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
             else:
@@ -309,7 +295,6 @@ def embedded_images_by_row_smart(
                     if abs(center_col_1b - prefer_col_1b) < abs(old_cc - prefer_col_1b):
                         tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
 
-    # strip center_col
     for r, (name, data, _) in tmp.items():
         out[r] = (name, data)
     return out
@@ -341,7 +326,7 @@ def read_csv_safely(uploaded_file, enc_choice: str, delim_choice: str):
                 continue
     raise last_err or RuntimeError("Failed to parse CSV with given options.")
 
-# ---------------------- Background processing (lazy rembg) ----------------------
+# ---------------------- Background + Upscale ----------------------
 def _get_rembg_remove():
     try:
         from rembg import remove as _remove
@@ -349,29 +334,105 @@ def _get_rembg_remove():
     except Exception:
         return None
 
-def process_image_bytes(data: bytes, mode: str) -> Tuple[bytes, str]:
+def _ensure_mode(img: Image.Image, want_alpha: bool) -> Image.Image:
+    if want_alpha:
+        return img.convert("RGBA")
+    return img.convert("RGB")
+
+def _upscale(img: Image.Image, up_mode: str, w: int, h: int, transparent: bool) -> Image.Image:
     """
-    mode: 'none' | 'remove' | 'white'
-    returns: (image_bytes, suggested_extension)
+    up_mode: 'none' | 'scale_min' | 'pad_box' | 'fill_box'
+    w,h: target box or minimums
+    transparent: True → transparent canvas when padding; False → white canvas
     """
-    if mode == "none":
-        return data, ".jpg"
-    rembg_remove = _get_rembg_remove()
-    if rembg_remove is None:
-        # rembg/onnxruntime not available -> skip processing gracefully
-        return data, ".jpg"
+    if up_mode == "none":
+        return img
+
+    W, H = img.size
+    if up_mode == "scale_min":
+        s = max(w / W if W < w else 1.0, h / H if H < h else 1.0)
+        if s > 1.0:
+            new = (int(round(W * s)), int(round(H * s)))
+            return img.resize(new, Image.LANCZOS)
+        return img
+
+    if up_mode in ("pad_box", "fill_box"):
+        if up_mode == "pad_box":
+            # fit inside box (no crop)
+            s = min(w / W, h / H)
+        else:
+            # fill box (crop overflow)
+            s = max(w / W, h / H)
+        new = (int(round(W * s)), int(round(H * s)))
+        scaled = img.resize(new, Image.LANCZOS)
+
+        if up_mode == "pad_box":
+            if transparent:
+                canvas = Image.new("RGBA", (w, h), (0, 0, 0, 0))
+            else:
+                canvas = Image.new("RGB", (w, h), (255, 255, 255))
+            ox = (w - new[0]) // 2
+            oy = (h - new[1]) // 2
+            if scaled.mode == "RGBA" and transparent:
+                canvas.paste(scaled, (ox, oy), scaled)
+            else:
+                canvas.paste(scaled, (ox, oy))
+            return canvas
+
+        # fill_box → center crop to exact WxH
+        left = (new[0] - w) // 2
+        top = (new[1] - h) // 2
+        return scaled.crop((left, top, left + w, top + h))
+
+    return img
+
+def process_image_bytes(data: bytes, bg_mode: str, up_mode: str, up_w: int, up_h: int) -> Tuple[bytes, str]:
+    """
+    bg_mode: 'none' | 'remove' | 'white'
+    up_mode: 'none' | 'scale_min' | 'pad_box' | 'fill_box'
+    """
+    # 1) Start image
     try:
-        out = rembg_remove(data)  # PNG with alpha
-        if mode == "remove":
-            return out, ".png"
-        img = Image.open(io.BytesIO(out)).convert("RGBA")
-        bg = Image.new("RGBA", img.size, (255, 255, 255, 255))
-        bg.paste(img, mask=img.split()[-1])
-        buf = io.BytesIO()
-        bg.convert("RGB").save(buf, format="JPEG", quality=95)
-        return buf.getvalue(), ".jpg"
+        base = Image.open(io.BytesIO(data))
     except Exception:
+        # If not decodable, return as-is
         return data, ".jpg"
+
+    rembg_remove = _get_rembg_remove()
+
+    # 2) Background handling
+    if bg_mode == "remove" and rembg_remove is not None:
+        try:
+            removed = rembg_remove(data)  # bytes (PNG with alpha)
+            base = Image.open(io.BytesIO(removed)).convert("RGBA")
+        except Exception:
+            base = base.convert("RGBA")
+    elif bg_mode == "white":
+        base = base.convert("RGBA")
+        bg = Image.new("RGBA", base.size, (255, 255, 255, 255))
+        bg.paste(base, mask=base.split()[-1] if base.mode == "RGBA" else None)
+        base = bg.convert("RGB")
+    else:
+        # no change
+        # keep alpha if present, else RGB
+        base = base.convert("RGBA" if base.mode == "RGBA" else "RGB")
+
+    # 3) Upscale
+    transparent = (bg_mode == "remove")
+    want_alpha = (bg_mode == "remove")
+    base = _ensure_mode(base, want_alpha)
+    base = _upscale(base, up_mode, up_w, up_h, transparent)
+
+    # 4) Encode
+    buf = io.BytesIO()
+    if bg_mode == "remove":
+        # keep transparency as PNG
+        base.save(buf, format="PNG")
+        return buf.getvalue(), ".png"
+    else:
+        # JPG for white or none (smaller size)
+        base.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+        return buf.getvalue(), ".jpg"
 
 def get_bytes_from_url(url: str) -> Optional[bytes]:
     try:
@@ -388,7 +449,7 @@ def get_bytes_from_url(url: str) -> Optional[bytes]:
 st.title("🔗 Image → Link Converter (Cloudinary)")
 st.markdown(
     "- **XLSX**: supports embedded pictures (inserted over cells)\n"
-    "- **CSV**: image column must contain **URLs**. If you choose a background option, URLs are downloaded → processed → re-uploaded.\n"
+    "- **CSV**: image column must contain **URLs**. With background/size options, URLs are downloaded → processed → re-uploaded.\n"
     "- Links are public (unlisted) on Cloudinary."
 )
 
@@ -398,12 +459,32 @@ uploaded = st.file_uploader("Upload a .xlsx or .csv", type=["xlsx","csv"])
 if not uploaded:
     st.stop()
 
+# Background option
 bg_choice = st.selectbox(
     "Background",
     ["No change", "Remove background (transparent PNG)", "Set white background (JPG)"],
     index=0
 )
 bg_mode = {"No change": "none", "Remove background (transparent PNG)": "remove", "Set white background (JPG)": "white"}[bg_choice]
+
+# Upscale option
+up_choice = st.selectbox(
+    "Upscale (agrandissage)",
+    ["No upscale", "Scale up if smaller (keep ratio)", "Pad to box (no distortion)", "Fill & crop to box"],
+    index=0
+)
+up_mode = {
+    "No upscale": "none",
+    "Scale up if smaller (keep ratio)": "scale_min",
+    "Pad to box (no distortion)": "pad_box",
+    "Fill & crop to box": "fill_box",
+}[up_choice]
+
+col_w, col_h = st.columns(2)
+with col_w:
+    up_w = st.number_input("Target width (px)", min_value=64, max_value=8000, value=1200, step=50)
+with col_h:
+    up_h = st.number_input("Target height (px)", min_value=64, max_value=8000, value=1200, step=50)
 
 suffix = Path(uploaded.name).suffix.lower()
 
@@ -443,7 +524,6 @@ if suffix == ".xlsx":
     smart_snap = st.checkbox("Smart row snap (use image vertical center)", value=True)
 
     if st.button("Convert"):
-        # mapping modes
         data_start = header_row + 1
         data_end   = header_row + len(df)
         if smart_snap:
@@ -463,35 +543,32 @@ if suffix == ".xlsx":
         for r in range(len(df)):
             product = str(df.iat[r, n_idx] or "").strip()
             img_txt = str(df.iat[r, i_idx] or "").strip()
-            excel_row_1b = header_row + 1 + r  # strict row mapping (prevents shift)
+            excel_row_1b = header_row + 1 + r  # strict row mapping
 
             emb_name, emb_bytes = embedded.get(excel_row_1b, (None, None))
             url_in_cell = extract_url_from_cell(img_txt)
 
-            if url_in_cell and bg_mode != "none":
-                raw = get_bytes_from_url(url_in_cell)
-                if raw:
-                    processed, ext = process_image_bytes(raw, bg_mode)
+            if url_in_cell:
+                raw = get_bytes_from_url(url_in_cell) if (bg_mode != "none" or up_mode != "none") else None
+                if raw:  # we need processing
+                    processed, ext = process_image_bytes(raw, bg_mode, up_mode, up_w, up_h)
                     fname = clean_filename(product or "image") + ext
                     link = upload_bytes_to_cloudinary(processed, fname)
                 else:
                     link = url_in_cell
-            elif url_in_cell:
-                link = url_in_cell
             elif emb_bytes:
-                processed, ext = process_image_bytes(emb_bytes, bg_mode)
+                processed, ext = process_image_bytes(emb_bytes, bg_mode, up_mode, up_w, up_h)
                 base = Path(emb_name or "image").stem
                 fname = clean_filename(product or base) + ext
                 link = upload_bytes_to_cloudinary(processed, fname)
             else:
-                link = ""  # keep alignment when no image
+                link = ""  # keep alignment
 
-            links.append(link)  # exactly one append per row
+            links.append(link)
             prog.progress(int((r + 1) / len(df) * 100))
 
         df.insert(i_idx + 1, "Image Link", links)
 
-        # Downloads
         out_xlsx = io.BytesIO()
         with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
             df.to_excel(w, sheet_name=sheet, index=False)
@@ -535,7 +612,7 @@ else:
         if n_idx is None: n_idx = n_auto
         if i_idx is None: i_idx = i_auto
 
-    st.info("For CSV: the image column should be **URLs**. If you choose a background option, each URL is downloaded, processed, and re-uploaded to Cloudinary.")
+    st.info("For CSV: the image column should be **URLs**. With background/size options, each URL is downloaded, processed, and re-uploaded to Cloudinary.")
 
     if st.button("Convert"):
         links = []
@@ -545,10 +622,10 @@ else:
             img_txt = str(row[i_idx] or "").strip()
             url = extract_url_from_cell(img_txt)
 
-            if url and bg_mode != "none":
+            if url and (bg_mode != "none" or up_mode != "none"):
                 raw = get_bytes_from_url(url)
                 if raw:
-                    processed, ext = process_image_bytes(raw, bg_mode)
+                    processed, ext = process_image_bytes(raw, bg_mode, up_mode, up_w, up_h)
                     fname = clean_filename(product or "image") + ext
                     link = upload_bytes_to_cloudinary(processed, fname)
                 else:
@@ -573,3 +650,8 @@ else:
         st.download_button("⬇️ Download CSV", data=out_csv,
                            file_name=Path(uploaded.name).stem + "_with_links.csv",
                            mime="text/csv")
+
+# =======================
+# 📁 Batch upload: Folder / ZIP of images (optional section you added earlier)
+# (keep your existing folder/ZIP section here if you already pasted it)
+# =======================
