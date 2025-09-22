@@ -15,7 +15,7 @@ from PIL import Image
 # Page & global CSS helpers (background + glass card look)
 # ---------------------------------------------------------
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.worksheet.header_footer")
-st.set_page_config(page_title="Image → Link Converter (Cloudinary)", page_icon="🔗", layout="centered")
+st.set_page_config(page_title="Image → Link Converter ", page_icon="🔗", layout="centered")
 
 def set_background_from_url(url: str, dark_overlay: float = 0.30):
     st.markdown(f"""
@@ -48,7 +48,7 @@ def set_background_from_local(path: str, dark_overlay: float = 0.30):
     """, unsafe_allow_html=True)
 
 # === Change this to your background (URL recommended; Cloudinary URL works great) ===
-BACKGROUND_URL = "https://images.unsplash.com/photo-1542831371-29b0f74f9713?q=80&w=1920&auto=format&fit=crop"
+BACKGROUND_URL = "https://res.cloudinary.com/dqye9uju0/image/upload/v1758554635/NsvG1713971804597-Artboard20220copy100_gocy5z.jpg"
 set_background_from_url(BACKGROUND_URL, dark_overlay=0.35)
 
 # “Glass” card and overall UI polish
