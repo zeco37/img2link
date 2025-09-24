@@ -19,7 +19,7 @@ COMPANY_NAME = "Ora Technologies"        # <- change
 COMPANY_URL  = "https://www.kooul.ma/"                    # optional, e.g. "https://yourcompany.com"
 
 # Logo for favicon + header (local path OR URL). Keep PNG (256x256) if possible.
-LOGO_SOURCE  = "assets/imgi_58_cptt1713437025041-ORA20Logo20FR201.png"     # e.g. "https://res.cloudinary.com/xxx/image/upload/logo.png"
+LOGO_SOURCE  = "assets/attachment-clip-page-paper-icon-vector-design-png_117669.jpg"     # e.g. "https://res.cloudinary.com/xxx/image/upload/logo.png"
 
 # Background image (URL is best; you can also embed a local image)
 BACKGROUND_URL = (
