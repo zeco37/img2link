@@ -518,7 +518,7 @@ tab_table, tab_images, tab_tool2 = st.tabs([
 ])
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 7) TOOL 2 : DOWNLOAD IMAGES FROM CSV → ZIP
+# 7) TOOL 3 : DOWNLOAD IMAGES FROM CSV → ZIP  (FINAL VERSION)
 # ───────────────────────────────────────────────────────────────────────────────
 with tab_tool2:
     st.header("📥 Download Images From CSV")
@@ -531,7 +531,7 @@ with tab_tool2:
 
         st.write("📌 Columns detected:", list(df2.columns))
 
-        # Auto-detect columns
+        # Auto-detect name + URL columns
         auto_product = None
         auto_url = None
         for col in df2.columns:
@@ -541,24 +541,33 @@ with tab_tool2:
             if any(x in low for x in ["url", "image", "img", "link"]):
                 auto_url = col
 
-        product_col = st.selectbox("Select product column", df2.columns, index=df2.columns.get_loc(auto_product) if auto_product else 0)
-        url_col = st.selectbox("Select image URL column", df2.columns, index=df2.columns.get_loc(auto_url) if auto_url else 0)
+        product_col = st.selectbox("Select product column", df2.columns, 
+                                   index=df2.columns.get_loc(auto_product) if auto_product else 0)
+        url_col = st.selectbox("Select image URL column", df2.columns, 
+                               index=df2.columns.get_loc(auto_url) if auto_url else 0)
 
+        # Output directory
         output_dir = "downloaded_images"
         os.makedirs(output_dir, exist_ok=True)
 
+        # Sanitize filenames
         def sanitize(name):
             return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
 
+        # Button to start download
         if st.button("⬇️ Download Images & Generate ZIP"):
             downloaded = []
             prog = st.progress(0, text="Downloading images...")
 
             for i, row in df2.iterrows():
                 name = str(row[product_col]).strip()
-                url = str(row[url_col]).strip()
+                cell_raw = str(row[url_col]).strip()
 
-                if not url.startswith("http"):
+                # Extract URL using robust extractor
+                url = extract_url_from_cell(cell_raw)
+
+                if not url:
+                    print("SKIPPED URL:", cell_raw)
                     continue
 
                 try:
@@ -572,12 +581,16 @@ with tab_tool2:
                         fpath = os.path.join(output_dir, fname)
                         img.save(fpath, "JPEG", quality=95)
                         downloaded.append(fpath)
-                except:
-                    pass
+
+                    else:
+                        print("FAILED:", url, res.status_code)
+
+                except Exception as e:
+                    print("ERROR downloading:", url, e)
 
                 prog.progress(int((i + 1) / len(df2) * 100))
 
-            # ZIP creation
+            # Create ZIP
             zipname = "images_from_csv.zip"
             with zipfile.ZipFile(zipname, "w") as z:
                 for f in downloaded:
@@ -585,6 +598,7 @@ with tab_tool2:
 
             st.success(f"🎉 Done! {len(downloaded)} images downloaded.")
 
+            # Download ZIP
             with open(zipname, "rb") as f:
                 st.download_button("⬇️ Download ZIP", f, file_name=zipname)
 
