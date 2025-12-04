@@ -511,7 +511,83 @@ c1, c2 = st.columns(2)
 with c1: up_w = st.number_input("Target width (px)", 64, 8000, 1200, 50)
 with c2: up_h = st.number_input("Target height (px)", 64, 8000, 1200, 50)
 
-tab_table, tab_images = st.tabs(["📄 Table (.xlsx/.csv)", "📁 Images / ZIP"])
+tab_table, tab_images, tab_tool2 = st.tabs([
+    "📄 Table (.xlsx/.csv)", 
+    "📁 Images / ZIP",
+    "📥 Download Images from CSV"
+])
+
+# ───────────────────────────────────────────────────────────────────────────────
+# 7) TOOL 2 : DOWNLOAD IMAGES FROM CSV → ZIP
+# ───────────────────────────────────────────────────────────────────────────────
+with tab_tool2:
+    st.header("📥 Download Images From CSV")
+    st.caption("Upload a CSV file containing product names and image URLs. The tool will download all images and generate a ZIP file.")
+
+    csv_file2 = st.file_uploader("Upload CSV", type=["csv"], key="csv_downloader")
+
+    if csv_file2 is not None:
+        df2 = pd.read_csv(csv_file2, dtype=str).fillna("")
+
+        st.write("📌 Columns detected:", list(df2.columns))
+
+        # Auto-detect columns
+        auto_product = None
+        auto_url = None
+        for col in df2.columns:
+            low = col.lower()
+            if any(x in low for x in ["product", "name", "title"]):
+                auto_product = col
+            if any(x in low for x in ["url", "image", "img", "link"]):
+                auto_url = col
+
+        product_col = st.selectbox("Select product column", df2.columns, index=df2.columns.get_loc(auto_product) if auto_product else 0)
+        url_col = st.selectbox("Select image URL column", df2.columns, index=df2.columns.get_loc(auto_url) if auto_url else 0)
+
+        output_dir = "downloaded_images"
+        os.makedirs(output_dir, exist_ok=True)
+
+        def sanitize(name):
+            return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+
+        if st.button("⬇️ Download Images & Generate ZIP"):
+            downloaded = []
+            prog = st.progress(0, text="Downloading images...")
+
+            for i, row in df2.iterrows():
+                name = str(row[product_col]).strip()
+                url = str(row[url_col]).strip()
+
+                if not url.startswith("http"):
+                    continue
+
+                try:
+                    res = requests.get(url, timeout=20)
+                    if res.ok:
+                        img = Image.open(BytesIO(res.content))
+                        if img.mode == "RGBA":
+                            img = img.convert("RGB")
+
+                        fname = sanitize(name) + ".jpg"
+                        fpath = os.path.join(output_dir, fname)
+                        img.save(fpath, "JPEG", quality=95)
+                        downloaded.append(fpath)
+                except:
+                    pass
+
+                prog.progress(int((i + 1) / len(df2) * 100))
+
+            # ZIP creation
+            zipname = "images_from_csv.zip"
+            with zipfile.ZipFile(zipname, "w") as z:
+                for f in downloaded:
+                    z.write(f, os.path.basename(f))
+
+            st.success(f"🎉 Done! {len(downloaded)} images downloaded.")
+
+            with open(zipname, "rb") as f:
+                st.download_button("⬇️ Download ZIP", f, file_name=zipname)
+
 
 # ── Table tab
 with tab_table:
