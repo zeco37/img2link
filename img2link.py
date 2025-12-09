@@ -520,98 +520,95 @@ tab_table, tab_images, tab_tool2 = st.tabs([
 # ───────────────────────────────────────────────────────────────────────────────
 # 7) TOOL 3 : DOWNLOAD IMAGES FROM CSV → ZIP (UPDATED FINAL)
 # ───────────────────────────────────────────────────────────────────────────────
-with tab_tool2:
-    st.header("📥 Download Images From CSV/XLSX")
-    st.caption("Upload a CSV or Excel file. The tool will read product names and image URLs, download all images, and generate a ZIP file.")
+# ── Download Images tab
+with tab_download:
+    st.header("📥 Download Images From CSV / XLSX")
 
-    file2 = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], key="tool3_upload")
+    dl_file = st.file_uploader("Upload CSV or XLSX", type=["csv", "xlsx"], key="dl_file")
 
-    if file2 is not None:
-        suffix = Path(file2.name).suffix.lower()
+    if dl_file:
+        suffix = Path(dl_file.name).suffix.lower()
 
-        # ---- READ FILE ----
+        # Load data
         if suffix == ".csv":
-            try:
-                df2 = pd.read_csv(file2, dtype=str).fillna("")
-            except Exception as e:
-                st.error(f"❌ Could not read CSV: {e}")
-                st.stop()
+            df = pd.read_csv(dl_file)
+            sheet_name = None
+        else:
+            xls = pd.ExcelFile(dl_file)
+            sheet_name = st.selectbox("Select sheet", xls.sheet_names)
+            df = pd.read_excel(xls, sheet_name=sheet_name)
 
-        elif suffix == ".xlsx":
-            try:
-                xls = pd.ExcelFile(file2)
-                sheet = st.selectbox("Select sheet", xls.sheet_names)
-                df2 = pd.read_excel(xls, sheet_name=sheet, dtype=str).fillna("")
-            except Exception as e:
-                st.error(f"❌ Could not read XLSX: {e}")
-                st.stop()
+        st.caption("📌 Columns detected:")
+        st.json(list(df.columns))
 
-        st.write("📌 Columns detected:", list(df2.columns))
+        product_col = st.selectbox("Select product column", df.columns)
+        url_col = st.selectbox("Select image URL column", df.columns)
 
-        # ---- COLUMN AUTODETECT ----
-        auto_product = None
-        auto_url = None
+        # Extract real hyperlinks for XLSX
+        def extract_urls_xlsx_real(f, sheet):
+            import openpyxl
+            wb = openpyxl.load_workbook(f, data_only=True)
+            ws = wb[sheet]
+            urls = []
+            for row in ws.iter_rows(min_row=2):
+                cell = row[1]  # column B (URL)
+                if cell.hyperlink:
+                    urls.append(cell.hyperlink.target)
+                else:
+                    urls.append(str(cell.value))
+            return urls
 
-        for col in df2.columns:
-            low = col.lower()
-            if any(x in low for x in ["product", "name", "title"]):
-                auto_product = col
-            if any(x in low for x in ["url", "image", "img", "link"]):
-                auto_url = col
+        if suffix == ".xlsx" and sheet_name:
+            urls = extract_urls_xlsx_real(dl_file, sheet_name)
+            df[url_col] = urls
 
-        product_col = st.selectbox("Select product column", df2.columns, index=df2.columns.get_loc(auto_product) if auto_product else 0)
-        url_col = st.selectbox("Select image URL column", df2.columns, index=df2.columns.get_loc(auto_url) if auto_url else 0)
+        if st.button("⬇️ Download Images & Generate ZIP", key="dl_zip_btn"):
 
-        # ---- OUTPUT DIR ----
-        output_dir = "downloaded_images"
-        os.makedirs(output_dir, exist_ok=True)
+            zip_io = io.BytesIO()
+            zipf = zipfile.ZipFile(zip_io, "w", zipfile.ZIP_DEFLATED)
 
-        # ---- SANITIZE ----
-        def sanitize(name):
-            return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
+            count = 0
+            progress = st.progress(0)
 
-        # ---- START ----
-        if st.button("⬇️ Download Images & Generate ZIP"):
-            downloaded = []
-            prog = st.progress(0, text="Downloading images...")
-
-            for i, row in df2.iterrows():
+            for i, row in df.iterrows():
                 name = str(row[product_col]).strip()
-                raw_cell = str(row[url_col]).strip()
+                url = str(row[url_col]).strip()
 
-                # Extract URL using robust extractor
-                url = extract_url_from_cell(raw_cell)
-
-                if not url:
-                    print("SKIPPED:", raw_cell)
+                if not url.startswith("http"):
                     continue
 
                 try:
-                    res = requests.get(url, timeout=20)
-                    if res.ok:
-                        img = Image.open(BytesIO(res.content))
+                    r = requests.get(url, timeout=20)
+                    if r.ok:
+                        img = Image.open(io.BytesIO(r.content))
+
                         if img.mode == "RGBA":
                             img = img.convert("RGB")
 
-                        fname = sanitize(name) + ".jpg"
-                        fpath = os.path.join(output_dir, fname)
-                        img.save(fpath, "JPEG", quality=95)
-                        downloaded.append(fpath)
-                except Exception as e:
-                    print("ERROR:", url, e)
+                        fname = name.replace("/", "_").replace("\\", "_") + ".jpg"
+                        buf = io.BytesIO()
+                        img.save(buf, format="JPEG", quality=95)
+                        buf.seek(0)
 
-                prog.progress(int((i + 1) / len(df2) * 100))
+                        zipf.writestr(fname, buf.getvalue())
+                        count += 1
 
-            # ---- ZIP ----
-            zipname = "images_from_file.zip"
-            with zipfile.ZipFile(zipname, "w") as z:
-                for f in downloaded:
-                    z.write(f, os.path.basename(f))
+                except Exception:
+                    pass
 
-            st.success(f"🎉 Done! {len(downloaded)} images downloaded.")
-            with open(zipname, "rb") as f:
-                st.download_button("⬇️ Download ZIP", f, file_name=zipname)
+                progress.progress((i + 1) / len(df))
 
+            zipf.close()
+
+            st.success(f"🎉 Done! {count} images downloaded.")
+
+            st.download_button(
+                "⬇️ Download ZIP",
+                data=zip_io.getvalue(),
+                file_name="images.zip",
+                mime="application/zip",
+                key="dl_zip_download"
+            )
 
 # ── Table tab
 with tab_table:
