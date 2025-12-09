@@ -518,8 +518,9 @@ tab_table, tab_images, tab_tool2 = st.tabs([
 ])
 
 # ───────────────────────────────────────────────────────────────────────────────
-# 7) TOOL 3 : DOWNLOAD IMAGES FROM CSV → ZIP  (FINAL VERSION)
+# 7) TOOL 3 : DOWNLOAD IMAGES FROM CSV → ZIP (UPDATED FINAL)
 # ───────────────────────────────────────────────────────────────────────────────
+
 with tab_tool2:
     st.header("📥 Download Images From CSV")
     st.caption("Upload a CSV file containing product names and image URLs. The tool will download all images and generate a ZIP file.")
@@ -527,11 +528,16 @@ with tab_tool2:
     csv_file2 = st.file_uploader("Upload CSV", type=["csv"], key="csv_downloader")
 
     if csv_file2 is not None:
-        df2 = pd.read_csv(csv_file2, dtype=str).fillna("")
+        # Read CSV safely
+        try:
+            df2 = pd.read_csv(csv_file2, dtype=str).fillna("")
+        except Exception as e:
+            st.error(f"❌ Could not read CSV: {e}")
+            st.stop()
 
         st.write("📌 Columns detected:", list(df2.columns))
 
-        # Auto-detect name + URL columns
+        # Auto-detect columns
         auto_product = None
         auto_url = None
         for col in df2.columns:
@@ -541,33 +547,38 @@ with tab_tool2:
             if any(x in low for x in ["url", "image", "img", "link"]):
                 auto_url = col
 
-        product_col = st.selectbox("Select product column", df2.columns, 
-                                   index=df2.columns.get_loc(auto_product) if auto_product else 0)
-        url_col = st.selectbox("Select image URL column", df2.columns, 
-                               index=df2.columns.get_loc(auto_url) if auto_url else 0)
+        product_col = st.selectbox(
+            "Select product column", 
+            df2.columns, 
+            index=df2.columns.get_loc(auto_product) if auto_product else 0
+        )
 
-        # Output directory
+        url_col = st.selectbox(
+            "Select image URL column",
+            df2.columns, 
+            index=df2.columns.get_loc(auto_url) if auto_url else 0
+        )
+
+        # Output dir
         output_dir = "downloaded_images"
         os.makedirs(output_dir, exist_ok=True)
 
-        # Sanitize filenames
         def sanitize(name):
             return re.sub(r'[<>:"/\\|?*]', "_", name).strip()
 
-        # Button to start download
         if st.button("⬇️ Download Images & Generate ZIP"):
             downloaded = []
             prog = st.progress(0, text="Downloading images...")
 
             for i, row in df2.iterrows():
                 name = str(row[product_col]).strip()
-                cell_raw = str(row[url_col]).strip()
+                raw_cell = str(row[url_col]).strip()
 
-                # Extract URL using robust extractor
-                url = extract_url_from_cell(cell_raw)
+                # Extract robust URL
+                url = extract_url_from_cell(raw_cell)
 
                 if not url:
-                    print("SKIPPED URL:", cell_raw)
+                    print("SKIPPED:", raw_cell)
                     continue
 
                 try:
@@ -586,7 +597,7 @@ with tab_tool2:
                         print("FAILED:", url, res.status_code)
 
                 except Exception as e:
-                    print("ERROR downloading:", url, e)
+                    print("ERROR:", url, e)
 
                 prog.progress(int((i + 1) / len(df2) * 100))
 
@@ -598,10 +609,8 @@ with tab_tool2:
 
             st.success(f"🎉 Done! {len(downloaded)} images downloaded.")
 
-            # Download ZIP
             with open(zipname, "rb") as f:
                 st.download_button("⬇️ Download ZIP", f, file_name=zipname)
-
 
 # ── Table tab
 with tab_table:
