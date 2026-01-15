@@ -1,14 +1,15 @@
-# app.py
-import io, os, re, zipfile, posixpath, warnings, csv, base64, datetime
+import io, os, re, zipfile, posixpath, warnings, csv, base64, datetime, mimetypes
 from pathlib import Path
 from typing import Optional, Dict, Tuple, List
 from xml.etree import ElementTree as ET
+
 import streamlit as st
 import pandas as pd
 import boto3
 from botocore.client import Config
 import requests
 from PIL import Image
+
 
 # 1) Brand & look (CHANGE THESE)
 AUTHOR_NAME  = "Zakaria Belalioui"
@@ -17,8 +18,8 @@ COMPANY_URL  = "https://www.kooul.ma/"
 LOGO_SOURCE  = "assets/attachment-clip-page-paper-icon-vector-design-png_117669.jpg"
 BACKGROUND_URL = "https://res.cloudinary.com/dqye9uju0/image/upload/v1758554635/NsvG1713971804597-Artboard20220copy100_gocy5z.jpg"
 
+
 # 2) Page, favicon, background & CSS
-# ───────────────────────────────────────────────────────────────────────────────
 warnings.filterwarnings("ignore", category=UserWarning, module="openpyxl.worksheet.header_footer")
 
 def _pil_icon_from_source(src: str) -> Optional[Image.Image]:
@@ -67,7 +68,6 @@ def set_background_from_url(url: str, dark_overlay: float = 0.35):
 
 set_background_from_url(BACKGROUND_URL, dark_overlay=0.35)
 
-# Global polish
 st.markdown("""
 <style>
 .main .block-container { max-width: 1120px; }
@@ -97,7 +97,6 @@ div[data-baseweb="tab-list"] button[aria-selected="true"] {
 }
 .stFileUploader > section { border-radius: 16px; background: rgba(255,255,255,.75); }
 
-/* Brand header */
 .brand-row {display:flex; align-items:center; gap:12px; margin:-4px 0 10px;}
 .brand-row .brand-logo {width:40px; height:40px; border-radius:10px; box-shadow:0 2px 8px rgba(0,0,0,.12);}
 .brand-title {font-size:26px; font-weight:800; letter-spacing:.2px;}
@@ -106,7 +105,6 @@ footer {visibility: hidden;}
 </style>
 """, unsafe_allow_html=True)
 
-# Brand header (logo + title + your name/company)
 logo_data_uri = _data_uri_from_source(LOGO_SOURCE)
 logo_html = f'<img class="brand-logo" src="{logo_data_uri}"/>' if logo_data_uri else ""
 
@@ -124,59 +122,28 @@ st.markdown(f"""
 </div>
 """, unsafe_allow_html=True)
 
-def init_s3_from_secrets():
-    try:
-        s3 = boto3.client(
-            "s3",
-            endpoint_url=st.secrets["S3_ENDPOINT_URL"],
-            aws_access_key_id=st.secrets["S3_ACCESS_KEY"],
-            aws_secret_access_key=st.secrets["S3_SECRET_KEY"],
-            region_name=st.secrets.get("S3_REGION"),
-            config=Config(signature_version="s3v4"),
-        )
-        st.session_state["S3"] = s3
-        return True
-    except Exception as e:
-        st.error(f"S3 init failed: {e}")
-        return False
-def upload_bytes_to_s3(data: bytes, filename: str) -> str:
-    s3 = st.session_state["S3"]
-    bucket = st.secrets["S3_BUCKET"]
-    folder = st.secrets.get("S3_FOLDER", "").strip("/")
-    key = f"{folder}/{filename}" if folder else filename
 
-    s3.put_object(
-        Bucket=bucket,
-        Key=key,
-        Body=data,
-        ACL="public-read",
-        ContentType="image/jpeg" if filename.lower().endswith(".jpg") else "image/png"
-    )
-
-    base = st.secrets["S3_PUBLIC_BASE"].rstrip("/")
-    return f"{base}/{key}"
-# ── Missing helpers (REQUIRED)
+# ───────────────────────────────────────────────────────────────────────────────
+# Helpers (REQUIRED)
 # ───────────────────────────────────────────────────────────────────────────────
 
 def clean_filename(s: str) -> str:
     s = (s or "image").strip()
     s = re.sub(r'[\\/:*?"<>|]+', "_", s)
-    s = re.sub(r"\s+", " ", s)
-    return s[:120] or "image"
-
+    s = re.sub(r"\s+", " ", s).strip()
+    s = s.replace("..", ".")
+    return (s[:140] or "image")
 
 def extract_url_from_cell(text: str) -> Optional[str]:
     if not text:
         return None
-    m = re.search(r"(https?://[^\s\"'>]+)", text)
+    m = re.search(r"(https?://[^\s\"'>]+)", str(text))
     return m.group(1) if m else None
-
 
 def auto_detect_columns(df: pd.DataFrame,
                         name_hint: Optional[str],
                         img_hint: Optional[str]) -> Tuple[int, int]:
     cols = [str(c).lower() for c in df.columns]
-
     name_idx = None
     img_idx = None
 
@@ -194,7 +161,7 @@ def auto_detect_columns(df: pd.DataFrame,
 
     if name_idx is None:
         for i, c in enumerate(cols):
-            if any(k in c for k in ["name", "product", "title", "libelle"]):
+            if any(k in c for k in ["name", "product", "title", "libelle", "nom"]):
                 name_idx = i
                 break
 
@@ -206,194 +173,60 @@ def auto_detect_columns(df: pd.DataFrame,
 
     if name_idx is None or img_idx is None:
         raise ValueError("Could not auto-detect product/image columns")
-
     return name_idx, img_idx
 
-# 4) XLSX drawing XML mapping (strict / any-col / smart)
+
 # ───────────────────────────────────────────────────────────────────────────────
-NS_R   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
-NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
-NS_A   = "http://schemas.openxmlformats.org/drawingml/2006/main"
-
-def _et_from_zip(z: zipfile.ZipFile, path: str):
-    try: return ET.fromstring(z.read(path))
-    except KeyError: return None
-
-def _rels_map(z: zipfile.ZipFile, rels_path: str) -> Dict[str,str]:
-    root = _et_from_zip(z, rels_path)
-    if root is None: return {}
-    m = {}
-    for rel in root:
-        if rel.tag.endswith("Relationship"):
-            m[rel.attrib["Id"]] = rel.attrib["Target"]
-    return m
-
-def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col_idx_1b: int) -> Dict[int, Tuple[str, bytes]]:
-    mapping: Dict[int, Tuple[str, bytes]] = {}
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
-        wb = _et_from_zip(z, "xl/workbook.xml")
-        if wb is None: return mapping
-        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
-
-        sheet_path = None
-        for s in wb.findall("{*}sheets/{*}sheet"):
-            if s.attrib.get("name") == sheet_name:
-                rid = s.attrib.get(f"{{{NS_R}}}id")
-                tgt = wb_rels.get(rid)
-                if tgt: sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
-                break
-        if not sheet_path: return mapping
-
-        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
-        drawing_target = None
-        for _, t in srels.items():
-            if "drawing" in t:
-                drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t))
-                break
-        if not drawing_target: return mapping
-        if not drawing_target.startswith("xl/"):
-            drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
-
-        dr = _et_from_zip(z, drawing_target)
-        if dr is None: return mapping
-        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
-
-        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
-        for a in anchors:
-            frm = a.find(f"{{{NS_XDR}}}from")
-            if frm is None: continue
-            c = frm.find(f"{{{NS_XDR}}}col"); r = frm.find(f"{{{NS_XDR}}}row")
-            if c is None or r is None: continue
-            col_1b = int(c.text) + 1
-            row_1b = int(r.text) + 1
-            if col_1b != image_col_idx_1b: continue
-
-            pic = a.find(f"{{{NS_XDR}}}pic")
-            if pic is None: continue
-            blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip")
-            if blip is None: continue
-            rid = blip.attrib.get(f"{{{NS_R}}}embed")
-            if not rid: continue
-            tgt = drrels.get(rid);  # path in drawing rels
-            if not tgt: continue
-
-            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
-            if not media_path.startswith("xl/"):
-                media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
-            try:
-                data = z.read(media_path)
-            except KeyError:
-                continue
-            mapping[row_1b] = (Path(media_path).name, data)
-    return mapping
-
-def embedded_images_by_row_anycol(xlsx_bytes: bytes, sheet_name: str) -> Dict[int, Tuple[str, bytes]]:
-    mapping: Dict[int, Tuple[str, bytes]] = {}
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
-        wb = _et_from_zip(z, "xl/workbook.xml")
-        if wb is None: return mapping
-        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
-        sheet_path = None
-        for s in wb.findall("{*}sheets/{*}sheet"):
-            if s.attrib.get("name") == sheet_name:
-                rid = s.attrib.get(f"{{{NS_R}}}id")
-                tgt = wb_rels.get(rid)
-                if tgt: sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
-                break
-        if not sheet_path: return mapping
-        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
-        drawing_target = None
-        for _, t in srels.items():
-            if "drawing" in t:
-                drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t))
-                break
-        if not drawing_target: return mapping
-        if not drawing_target.startswith("xl/"): drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
-        dr = _et_from_zip(z, drawing_target)
-        if dr is None: return mapping
-        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
-        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
-        for a in anchors:
-            frm = a.find(f"{{{NS_XDR}}}from");  r = frm.find(f"{{{NS_XDR}}}row") if frm is not None else None
-            if r is None: continue
-            row_1b = int(r.text) + 1
-            pic = a.find(f"{{{NS_XDR}}}pic");  blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip") if pic is not None else None
-            if blip is None: continue
-            rid = blip.attrib.get(f"{{{NS_R}}}embed");  tgt = drrels.get(rid) if rid else None
-            if not tgt: continue
-            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
-            if not media_path.startswith("xl/"): media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
-            try: data = z.read(media_path)
-            except KeyError: continue
-            mapping[row_1b] = (Path(media_path).name, data)
-    return mapping
-
-def embedded_images_by_row_smart(xlsx_bytes: bytes, sheet_name: str,
-                                 data_start_1b: int, data_end_1b: int,
-                                 prefer_col_1b: Optional[int]) -> Dict[int, Tuple[str, bytes]]:
-    out: Dict[int, Tuple[str, bytes]] = {}
-    tmp: Dict[int, Tuple[str, bytes, int]] = {}
-    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
-        wb = _et_from_zip(z, "xl/workbook.xml")
-        if wb is None: return out
-        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
-        sheet_path = None
-        for s in wb.findall("{*}sheets/{*}sheet"):
-            if s.attrib.get("name") == sheet_name:
-                rid = s.attrib.get(f"{{{NS_R}}}id")
-                tgt = wb_rels.get(rid)
-                if tgt: sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
-                break
-        if not sheet_path: return out
-        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
-        drawing_target = None
-        for _, t in srels.items():
-            if "drawing" in t: drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t)); break
-        if not drawing_target: return out
-        if not drawing_target.startswith("xl/"): drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
-        dr = _et_from_zip(z, drawing_target)
-        if dr is None: return out
-        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
-        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
-        for a in anchors:
-            frm = a.find(f"{{{NS_XDR}}}from");  fr = frm.find(f"{{{NS_XDR}}}row") if frm is not None else None
-            fc = frm.find(f"{{{NS_XDR}}}col") if frm is not None else None
-            if fr is None or fc is None: continue
-            fr0 = int(fr.text); fc0 = int(fc.text)
-            to = a.find(f"{{{NS_XDR}}}to")
-            if to is not None:
-                tr = to.find(f"{{{NS_XDR}}}row"); tc = to.find(f"{{{NS_XDR}}}col")
-                tr0 = int(tr.text) if tr is not None else fr0
-                tc0 = int(tc.text) if tc is not None else fc0
-            else:
-                tr0, tc0 = fr0, fc0
-            center_row_1b = int(round((fr0 + tr0) / 2.0)) + 1
-            center_col_1b = int(round((fc0 + tc0) / 2.0)) + 1
-            snap_row_1b   = min(max(center_row_1b, data_start_1b), data_end_1b)
-            pic = a.find(f"{{{NS_XDR}}}pic"); blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip") if pic is not None else None
-            if blip is None: continue
-            rid = blip.attrib.get(f"{{{NS_R}}}embed"); tgt = drrels.get(rid) if rid else None
-            if not tgt: continue
-            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
-            if not media_path.startswith("xl/"): media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
-            try: data = z.read(media_path)
-            except KeyError: continue
-            if snap_row_1b not in tmp:
-                tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
-            else:
-                if prefer_col_1b is not None:
-                    _, _, old_cc = tmp[snap_row_1b]
-                    if abs(center_col_1b - prefer_col_1b) < abs(old_cc - prefer_col_1b):
-                        tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
-    for r, (name, data, _) in tmp.items():
-        out[r] = (name, data)
-    return out
-
-# 5) CSV helper + image processing (background + upscaling)
+# S3 (AWS) - NO ACL, public via bucket policy
+# URL format must be: https://static.ora.ma/streamlit/<file_name>
 # ───────────────────────────────────────────────────────────────────────────────
+
+def init_s3_from_secrets() -> bool:
+    try:
+        s3 = boto3.client(
+            "s3",
+            aws_access_key_id=st.secrets["S3_ACCESS_KEY"],
+            aws_secret_access_key=st.secrets["S3_SECRET_KEY"],
+            region_name=st.secrets.get("S3_REGION", "eu-west-3"),
+            config=Config(signature_version="s3v4"),
+        )
+        st.session_state["S3"] = s3
+        return True
+    except Exception as e:
+        st.error(f"S3 init failed: {e}")
+        return False
+
+def _guess_content_type(filename: str) -> str:
+    ct, _ = mimetypes.guess_type(filename)
+    return ct or ("image/png" if filename.lower().endswith(".png") else "image/jpeg")
+
+def upload_bytes_to_s3(data: bytes, filename: str) -> str:
+    s3 = st.session_state["S3"]
+    bucket = st.secrets["S3_BUCKET"]
+
+    # We force the public URL format the user gave:
+    # https://static.ora.ma/streamlit/<file_name>
+    prefix = "streamlit"
+    key = f"{prefix}/{filename}".replace("\\", "/")
+
+    s3.put_object(
+        Bucket=bucket,
+        Key=key,
+        Body=data,
+        ContentType=_guess_content_type(filename),
+    )
+
+    return f"https://static.ora.ma/{key}"
+
+
+# ───────────────────────────────────────────────────────────────────────────────
+# CSV helper + image processing (background + upscaling)
+# ───────────────────────────────────────────────────────────────────────────────
+
 def read_csv_safely(uploaded_file, enc_choice: str, delim_choice: str):
     raw = uploaded_file.getvalue()
     enc_candidates = ["utf-8-sig", "utf-8", "cp1252", "latin1"] if enc_choice == "auto" else [enc_choice]
+
     if delim_choice == "auto":
         try:
             sample = raw[:4096].decode("utf-8", errors="ignore")
@@ -427,61 +260,357 @@ def _ensure_mode(img: Image.Image, want_alpha: bool) -> Image.Image:
     return img.convert("RGBA" if want_alpha else "RGB")
 
 def _upscale(img: Image.Image, up_mode: str, w: int, h: int, transparent: bool) -> Image.Image:
-    if up_mode == "none": return img
+    if up_mode == "none":
+        return img
+
     W, H = img.size
+    if W <= 0 or H <= 0:
+        return img
+
     if up_mode == "scale_min":
         s = max(w / W if W < w else 1.0, h / H if H < h else 1.0)
         return img.resize((int(round(W*s)), int(round(H*s))), Image.LANCZOS) if s > 1 else img
+
     if up_mode in ("pad_box", "fill_box"):
         s = min(w/W, h/H) if up_mode == "pad_box" else max(w/W, h/H)
-        new = (int(round(W*s)), int(round(H*s)))
+        new = (max(1, int(round(W*s))), max(1, int(round(H*s))))
         scaled = img.resize(new, Image.LANCZOS)
+
         if up_mode == "pad_box":
-            canvas = Image.new("RGBA" if transparent else "RGB", (w,h), (0,0,0,0) if transparent else (255,255,255))
-            ox = (w - new[0]) // 2; oy = (h - new[1]) // 2
-            if scaled.mode == "RGBA" and transparent: canvas.paste(scaled, (ox,oy), scaled)
-            else: canvas.paste(scaled, (ox,oy))
+            canvas = Image.new("RGBA" if transparent else "RGB", (w, h),
+                               (0,0,0,0) if transparent else (255,255,255))
+            ox = (w - new[0]) // 2
+            oy = (h - new[1]) // 2
+            if scaled.mode == "RGBA" and transparent:
+                canvas.paste(scaled, (ox, oy), scaled)
+            else:
+                canvas.paste(scaled, (ox, oy))
             return canvas
-        left = (new[0]-w)//2; top = (new[1]-h)//2
+
+        # fill_box
+        left = (new[0]-w)//2
+        top  = (new[1]-h)//2
         return scaled.crop((left, top, left+w, top+h))
+
     return img
 
 def process_image_bytes(data: bytes, bg_mode: str, up_mode: str, up_w: int, up_h: int) -> Tuple[bytes, str]:
-    try: base = Image.open(io.BytesIO(data))
-    except Exception: return data, ".jpg"
+    try:
+        base = Image.open(io.BytesIO(data))
+    except Exception:
+        return data, ".jpg"
+
+    # Fix weird modes like "P"
+    if base.mode in ("P", "CMYK", "LA"):
+        base = base.convert("RGBA")
+
     rembg_remove = _get_rembg_remove()
+
     if bg_mode == "remove" and rembg_remove is not None:
         try:
             removed = rembg_remove(data)
             base = Image.open(io.BytesIO(removed)).convert("RGBA")
         except Exception:
             base = base.convert("RGBA")
+
     elif bg_mode == "white":
         base = base.convert("RGBA")
         bg = Image.new("RGBA", base.size, (255,255,255,255))
         bg.paste(base, mask=base.split()[-1] if base.mode == "RGBA" else None)
         base = bg.convert("RGB")
+
     else:
-        base = base.convert("RGBA" if base.mode == "RGBA" else "RGB")
+        # no change
+        if base.mode == "RGBA":
+            base = base.convert("RGBA")
+        else:
+            base = base.convert("RGB")
+
     transparent = (bg_mode == "remove")
     base = _ensure_mode(base, transparent)
     base = _upscale(base, up_mode, up_w, up_h, transparent)
+
     buf = io.BytesIO()
     if bg_mode == "remove":
-        base.save(buf, format="PNG");  return buf.getvalue(), ".png"
+        base.save(buf, format="PNG")
+        return buf.getvalue(), ".png"
     else:
-        base.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True); return buf.getvalue(), ".jpg"
+        base.convert("RGB").save(buf, format="JPEG", quality=95, optimize=True)
+        return buf.getvalue(), ".jpg"
 
 def get_bytes_from_url(url: str) -> Optional[bytes]:
     try:
         r = requests.get(url, timeout=20)
-        if r.ok: return r.content
+        if r.ok:
+            return r.content
     except Exception:
         pass
     return None
 
+
+# ───────────────────────────────────────────────────────────────────────────────
+# XLSX drawing XML mapping (strict / any-col / smart)
+# ───────────────────────────────────────────────────────────────────────────────
+
+NS_R   = "http://schemas.openxmlformats.org/officeDocument/2006/relationships"
+NS_XDR = "http://schemas.openxmlformats.org/drawingml/2006/spreadsheetDrawing"
+NS_A   = "http://schemas.openxmlformats.org/drawingml/2006/main"
+
+def _et_from_zip(z: zipfile.ZipFile, path: str):
+    try:
+        return ET.fromstring(z.read(path))
+    except KeyError:
+        return None
+
+def _rels_map(z: zipfile.ZipFile, rels_path: str) -> Dict[str,str]:
+    root = _et_from_zip(z, rels_path)
+    if root is None:
+        return {}
+    m = {}
+    for rel in root:
+        if rel.tag.endswith("Relationship"):
+            m[rel.attrib["Id"]] = rel.attrib["Target"]
+    return m
+
+def embedded_images_by_row_via_xml(xlsx_bytes: bytes, sheet_name: str, image_col_idx_1b: int) -> Dict[int, Tuple[str, bytes]]:
+    mapping: Dict[int, Tuple[str, bytes]] = {}
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
+        wb = _et_from_zip(z, "xl/workbook.xml")
+        if wb is None:
+            return mapping
+        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
+
+        sheet_path = None
+        for s in wb.findall("{*}sheets/{*}sheet"):
+            if s.attrib.get("name") == sheet_name:
+                rid = s.attrib.get(f"{{{NS_R}}}id")
+                tgt = wb_rels.get(rid)
+                if tgt:
+                    sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
+                break
+        if not sheet_path:
+            return mapping
+
+        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
+        drawing_target = None
+        for _, t in srels.items():
+            if "drawing" in t:
+                drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t))
+                break
+        if not drawing_target:
+            return mapping
+        if not drawing_target.startswith("xl/"):
+            drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
+
+        dr = _et_from_zip(z, drawing_target)
+        if dr is None:
+            return mapping
+        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
+
+        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
+        for a in anchors:
+            frm = a.find(f"{{{NS_XDR}}}from")
+            if frm is None:
+                continue
+            c = frm.find(f"{{{NS_XDR}}}col")
+            r = frm.find(f"{{{NS_XDR}}}row")
+            if c is None or r is None:
+                continue
+
+            col_1b = int(c.text) + 1
+            row_1b = int(r.text) + 1
+            if col_1b != image_col_idx_1b:
+                continue
+
+            pic = a.find(f"{{{NS_XDR}}}pic")
+            if pic is None:
+                continue
+            blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip")
+            if blip is None:
+                continue
+            rid = blip.attrib.get(f"{{{NS_R}}}embed")
+            if not rid:
+                continue
+            tgt = drrels.get(rid)
+            if not tgt:
+                continue
+
+            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
+            if not media_path.startswith("xl/"):
+                media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
+
+            try:
+                data = z.read(media_path)
+            except KeyError:
+                continue
+            mapping[row_1b] = (Path(media_path).name, data)
+    return mapping
+
+def embedded_images_by_row_anycol(xlsx_bytes: bytes, sheet_name: str) -> Dict[int, Tuple[str, bytes]]:
+    mapping: Dict[int, Tuple[str, bytes]] = {}
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
+        wb = _et_from_zip(z, "xl/workbook.xml")
+        if wb is None:
+            return mapping
+        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
+
+        sheet_path = None
+        for s in wb.findall("{*}sheets/{*}sheet"):
+            if s.attrib.get("name") == sheet_name:
+                rid = s.attrib.get(f"{{{NS_R}}}id")
+                tgt = wb_rels.get(rid)
+                if tgt:
+                    sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
+                break
+        if not sheet_path:
+            return mapping
+
+        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
+        drawing_target = None
+        for _, t in srels.items():
+            if "drawing" in t:
+                drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t))
+                break
+        if not drawing_target:
+            return mapping
+        if not drawing_target.startswith("xl/"):
+            drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
+
+        dr = _et_from_zip(z, drawing_target)
+        if dr is None:
+            return mapping
+        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
+
+        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
+        for a in anchors:
+            frm = a.find(f"{{{NS_XDR}}}from")
+            r = frm.find(f"{{{NS_XDR}}}row") if frm is not None else None
+            if r is None:
+                continue
+            row_1b = int(r.text) + 1
+
+            pic = a.find(f"{{{NS_XDR}}}pic")
+            blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip") if pic is not None else None
+            if blip is None:
+                continue
+
+            rid = blip.attrib.get(f"{{{NS_R}}}embed")
+            tgt = drrels.get(rid) if rid else None
+            if not tgt:
+                continue
+
+            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
+            if not media_path.startswith("xl/"):
+                media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
+
+            try:
+                data = z.read(media_path)
+            except KeyError:
+                continue
+
+            mapping[row_1b] = (Path(media_path).name, data)
+    return mapping
+
+def embedded_images_by_row_smart(xlsx_bytes: bytes, sheet_name: str,
+                                 data_start_1b: int, data_end_1b: int,
+                                 prefer_col_1b: Optional[int]) -> Dict[int, Tuple[str, bytes]]:
+    out: Dict[int, Tuple[str, bytes]] = {}
+    tmp: Dict[int, Tuple[str, bytes, int]] = {}
+
+    with zipfile.ZipFile(io.BytesIO(xlsx_bytes), "r") as z:
+        wb = _et_from_zip(z, "xl/workbook.xml")
+        if wb is None:
+            return out
+        wb_rels = _rels_map(z, "xl/_rels/workbook.xml.rels")
+
+        sheet_path = None
+        for s in wb.findall("{*}sheets/{*}sheet"):
+            if s.attrib.get("name") == sheet_name:
+                rid = s.attrib.get(f"{{{NS_R}}}id")
+                tgt = wb_rels.get(rid)
+                if tgt:
+                    sheet_path = posixpath.normpath(posixpath.join("xl", tgt))
+                break
+        if not sheet_path:
+            return out
+
+        srels = _rels_map(z, posixpath.join(posixpath.dirname(sheet_path), "_rels", posixpath.basename(sheet_path)+".rels"))
+        drawing_target = None
+        for _, t in srels.items():
+            if "drawing" in t:
+                drawing_target = posixpath.normpath(posixpath.join(posixpath.dirname(sheet_path), t))
+                break
+        if not drawing_target:
+            return out
+        if not drawing_target.startswith("xl/"):
+            drawing_target = posixpath.normpath(posixpath.join("xl", drawing_target))
+
+        dr = _et_from_zip(z, drawing_target)
+        if dr is None:
+            return out
+
+        drrels = _rels_map(z, posixpath.join(posixpath.dirname(drawing_target), "_rels", posixpath.basename(drawing_target)+".rels"))
+        anchors = list(dr.findall(f"{{{NS_XDR}}}twoCellAnchor")) + list(dr.findall(f"{{{NS_XDR}}}oneCellAnchor"))
+
+        for a in anchors:
+            frm = a.find(f"{{{NS_XDR}}}from")
+            fr = frm.find(f"{{{NS_XDR}}}row") if frm is not None else None
+            fc = frm.find(f"{{{NS_XDR}}}col") if frm is not None else None
+            if fr is None or fc is None:
+                continue
+
+            fr0 = int(fr.text)
+            fc0 = int(fc.text)
+
+            to = a.find(f"{{{NS_XDR}}}to")
+            if to is not None:
+                tr = to.find(f"{{{NS_XDR}}}row")
+                tc = to.find(f"{{{NS_XDR}}}col")
+                tr0 = int(tr.text) if tr is not None else fr0
+                tc0 = int(tc.text) if tc is not None else fc0
+            else:
+                tr0, tc0 = fr0, fc0
+
+            center_row_1b = int(round((fr0 + tr0) / 2.0)) + 1
+            center_col_1b = int(round((fc0 + tc0) / 2.0)) + 1
+            snap_row_1b = min(max(center_row_1b, data_start_1b), data_end_1b)
+
+            pic = a.find(f"{{{NS_XDR}}}pic")
+            blip = pic.find(f"{{{NS_XDR}}}blipFill/{{{NS_A}}}blip") if pic is not None else None
+            if blip is None:
+                continue
+
+            rid = blip.attrib.get(f"{{{NS_R}}}embed")
+            tgt = drrels.get(rid) if rid else None
+            if not tgt:
+                continue
+
+            media_path = posixpath.normpath(posixpath.join(posixpath.dirname(drawing_target), tgt))
+            if not media_path.startswith("xl/"):
+                media_path = posixpath.normpath(posixpath.join("xl/drawings", tgt)).replace("drawings/../","")
+
+            try:
+                data = z.read(media_path)
+            except KeyError:
+                continue
+
+            if snap_row_1b not in tmp:
+                tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
+            else:
+                if prefer_col_1b is not None:
+                    _, _, old_cc = tmp[snap_row_1b]
+                    if abs(center_col_1b - prefer_col_1b) < abs(old_cc - prefer_col_1b):
+                        tmp[snap_row_1b] = (Path(media_path).name, data, center_col_1b)
+
+    for r, (name, data, _) in tmp.items():
+        out[r] = (name, data)
+    return out
+
+
+# ───────────────────────────────────────────────────────────────────────────────
 # 6) UI + logic
 # ───────────────────────────────────────────────────────────────────────────────
+
 st.caption("Convert tables (XLSX/CSV) that contain images to public links, or upload a folder/ZIP of images and get a link mapping.")
 
 if not init_s3_from_secrets():
@@ -502,21 +631,23 @@ up_choice = st.selectbox(
 up_mode = {"No upscale":"none","Scale up if smaller (keep ratio)":"scale_min","Pad to box (no distortion)":"pad_box","Fill & crop to box":"fill_box"}[up_choice]
 
 c1, c2 = st.columns(2)
-with c1: up_w = st.number_input("Target width (px)", 64, 8000, 1200, 50)
-with c2: up_h = st.number_input("Target height (px)", 64, 8000, 1200, 50)
+with c1:
+    up_w = st.number_input("Target width (px)", 64, 8000, 1200, 50)
+with c2:
+    up_h = st.number_input("Target height (px)", 64, 8000, 1200, 50)
 
 tab_table, tab_images, tab_tool2 = st.tabs([
-    "📄 Table (.xlsx/.csv)", 
+    "📄 Table (.xlsx/.csv)",
     "📁 Images / ZIP",
     "📥 Download Images from CSV"
 ])
-
 
 # ── Table tab
 with tab_table:
     table_file = st.file_uploader("Upload a .xlsx or .csv", type=["xlsx","csv"], key="table_uploader")
     if table_file is not None:
         suffix = Path(table_file.name).suffix.lower()
+
         # XLSX
         if suffix == ".xlsx":
             data = table_file.getvalue()
@@ -547,6 +678,7 @@ with tab_table:
             if st.button("Convert (XLSX)", key="convert_xlsx"):
                 data_start = header_row + 1
                 data_end   = header_row + len(df)
+
                 if smart_snap:
                     embedded = embedded_images_by_row_smart(
                         data, sheet, data_start, data_end,
@@ -554,17 +686,18 @@ with tab_table:
                     )
                 else:
                     embedded = embedded_images_by_row_anycol(data, sheet) if accept_any_col \
-                               else embedded_images_by_row_via_xml(data, sheet, i_idx + 1)
+                        else embedded_images_by_row_via_xml(data, sheet, i_idx + 1)
 
                 matched = sum(1 for r in range(len(df)) if (header_row + 1 + r) in embedded)
                 st.caption(f"Embedded pictures matched to rows: {matched}/{len(df)}")
 
                 links = []
                 prog = st.progress(0, text="Uploading…")
+
                 for r in range(len(df)):
                     product = str(df.iat[r, n_idx] or "").strip()
                     img_txt = str(df.iat[r, i_idx] or "").strip()
-                    excel_row_1b = header_row + 1 + r  # strict row mapping
+                    excel_row_1b = header_row + 1 + r
 
                     emb_name, emb_bytes = embedded.get(excel_row_1b, (None, None))
                     url_in_cell = extract_url_from_cell(img_txt)
@@ -577,13 +710,16 @@ with tab_table:
                             link = upload_bytes_to_s3(processed, fname)
                         else:
                             link = url_in_cell
+
                     elif emb_bytes:
                         processed, ext = process_image_bytes(emb_bytes, bg_mode, up_mode, up_w, up_h)
                         base = Path(emb_name or "image").stem
                         fname = clean_filename(product or base) + ext
                         link = upload_bytes_to_s3(processed, fname)
+
                     else:
-                        link = ""  # keep alignment
+                        link = ""
+
                     links.append(link)
                     prog.progress(int((r + 1) / len(df) * 100))
 
@@ -592,18 +728,28 @@ with tab_table:
                 out_xlsx = io.BytesIO()
                 with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
                     df.to_excel(w, sheet_name=sheet, index=False)
+
                 st.success("Done.")
-                st.download_button("⬇️ Download XLSX", data=out_xlsx.getvalue(),
-                                   file_name=Path(table_file.name).stem + "_with_links.xlsx",
-                                   mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                st.download_button(
+                    "⬇️ Download XLSX",
+                    data=out_xlsx.getvalue(),
+                    file_name=Path(table_file.name).stem + "_with_links.xlsx",
+                    mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                )
+
                 out_csv = df.to_csv(index=False).encode("utf-8")
-                st.download_button("⬇️ Download CSV", data=out_csv,
-                                   file_name=Path(table_file.name).stem + "_with_links.csv",
-                                   mime="text/csv")
+                st.download_button(
+                    "⬇️ Download CSV",
+                    data=out_csv,
+                    file_name=Path(table_file.name).stem + "_with_links.csv",
+                    mime="text/csv"
+                )
+
         # CSV
         else:
             enc   = st.selectbox("CSV encoding",  ["auto","utf-8","utf-8-sig","cp1252","latin1"], 0, key="csv_enc")
             delim = st.selectbox("CSV delimiter", ["auto",",",";","|","\\t"], 0, key="csv_delim")
+
             try:
                 df, used_enc, used_delim = read_csv_safely(table_file, enc, delim)
                 st.caption(f"Parsed with **{used_enc}** and delimiter **{repr(used_delim)}**")
@@ -624,6 +770,7 @@ with tab_table:
 
                 n_idx = (n_idx_in - 1) if n_idx_in > 0 else None
                 i_idx = (i_idx_in - 1) if i_idx_in > 0 else None
+
                 if auto or n_idx is None or i_idx is None:
                     try:
                         n_auto, i_auto = auto_detect_columns(df, name_hint or None, img_hint or None)
@@ -633,14 +780,18 @@ with tab_table:
                         st.error(str(e))
                         n_idx, i_idx = 0, 0
 
-                st.info("For CSV: the image column should be **URLs**. With background/size options, each URL is downloaded, processed, and re-uploaded to the company server.")
+                st.info("For CSV: the image column should be **URLs**. With background/size options, each URL is downloaded, processed, and re-uploaded to S3.")
 
                 if st.button("Convert (CSV)", key="convert_csv"):
-                    links = []; prog = st.progress(0, text="Processing…")
+                    links = []
+                    prog = st.progress(0, text="Processing…")
+
+                    total = len(df) if len(df) else 1
                     for r, row in enumerate(df.itertuples(index=False), 1):
                         product = str(row[n_idx] or "").strip()
                         img_txt = str(row[i_idx] or "").strip()
                         url = extract_url_from_cell(img_txt)
+
                         if url and (bg_mode != "none" or up_mode != "none"):
                             raw = get_bytes_from_url(url)
                             link = url
@@ -650,27 +801,43 @@ with tab_table:
                                 link = upload_bytes_to_s3(processed, fname)
                         else:
                             link = url or ""
-                        links.append(link); prog.progress(int(r/len(df)*100))
+
+                        links.append(link)
+                        prog.progress(int(r/total*100))
+
                     df.insert(i_idx + 1, "Image Link", links)
 
                     out_xlsx = io.BytesIO()
                     with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
                         df.to_excel(w, index=False)
-                    st.success("Done.")
-                    st.download_button("⬇️ Download XLSX", data=out_xlsx.getvalue(),
-                                       file_name=Path(table_file.name).stem + "_with_links.xlsx",
-                                       mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                    out_csv = df.to_csv(index=False).encode("utf-8")
-                    st.download_button("⬇️ Download CSV", data=out_csv,
-                                       file_name=Path(table_file.name).stem + "_with_links.csv",
-                                       mime="text/csv")
 
-# ── Images/ZIP tab
+                    st.success("Done.")
+                    st.download_button(
+                        "⬇️ Download XLSX",
+                        data=out_xlsx.getvalue(),
+                        file_name=Path(table_file.name).stem + "_with_links.xlsx",
+                        mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+                    )
+                    out_csv = df.to_csv(index=False).encode("utf-8")
+                    st.download_button(
+                        "⬇️ Download CSV",
+                        data=out_csv,
+                        file_name=Path(table_file.name).stem + "_with_links.csv",
+                        mime="text/csv"
+                    )
+
+
+# ── Images/ZIP tab (FIXED)
 with tab_images:
     st.caption("Drop a **.zip** of your folder or select many images. (Browsers can’t read raw folders.)")
+
     IMG_TYPES = ["zip","jpg","jpeg","png","webp","bmp","tif","tiff","gif"]
-    img_files = st.file_uploader("Drop a .zip OR select many images",
-                                 type=IMG_TYPES, accept_multiple_files=True, key="images_uploader")
+    img_files = st.file_uploader(
+        "Drop a .zip OR select many images",
+        type=IMG_TYPES,
+        accept_multiple_files=True,
+        key="images_uploader"
+    )
 
     name_source = st.selectbox(
         "Derive product name from",
@@ -685,15 +852,25 @@ with tab_images:
 
     if st.button("Upload images", key="upload_images") and img_files:
         to_process: List[Tuple[str, bytes]] = []
+
         for uf in img_files:
             if uf.name.lower().endswith(".zip"):
-                try: z = zipfile.ZipFile(io.BytesIO(uf.getvalue()), "r")
-                except Exception as e: st.error(f"Could not read ZIP {uf.name}: {e}"); continue
+                try:
+                    z = zipfile.ZipFile(io.BytesIO(uf.getvalue()), "r")
+                except Exception as e:
+                    st.error(f"Could not read ZIP {uf.name}: {e}")
+                    continue
+
                 for zi in z.infolist():
-                    if zi.is_dir(): continue
-                    if not re.search(r"\.(jpg|jpeg|png|webp|bmp|tif|tiff|gif)$", zi.filename, re.I): continue
-                    try: data = z.read(zi)
-                    except Exception: continue
+                    if zi.is_dir():
+                        continue
+                    if not re.search(r"\.(jpg|jpeg|png|webp|bmp|tif|tiff|gif)$", zi.filename, re.I):
+                        continue
+                    try:
+                        data = z.read(zi)
+                    except Exception:
+                        continue
+
                     if name_source == "File name (without extension)":
                         label = nice_label_from_path(zi.filename)
                     elif name_source == "ParentFolder/File name":
@@ -701,7 +878,9 @@ with tab_images:
                         label = f"{p.parent.name}/{nice_label_from_path(zi.filename)}" if p.parent.name else nice_label_from_path(zi.filename)
                     else:
                         label = zi.filename.replace("\\", "/").lstrip("./")
+
                     to_process.append((label, data))
+
             else:
                 data = uf.getvalue()
                 label = nice_label_from_path(uf.name)
@@ -710,32 +889,46 @@ with tab_images:
         if not to_process:
             st.warning("No images found in the files you provided.")
         else:
-            results = []; prog = st.progress(0, text="Uploading images…")
+            results = []
+            prog = st.progress(0, text="Uploading images…")
+            total = len(to_process)
+
             for i, (label, raw) in enumerate(to_process, 1):
-                processed, ext = process_image_bytes(raw, bg_mode, up_mode, up_w, up_h)
-                fname = clean_filename(label) + ext
                 try:
+                    processed, ext = process_image_bytes(raw, bg_mode, up_mode, up_w, up_h)
+                    fname = clean_filename(label) + ext
                     url = upload_bytes_to_s3(processed, fname)
                 except Exception as e:
                     url = ""
                     st.error(f"Upload failed for {label}: {e}")
-                    results.append({"File": label, "Product": clean_filename(label), "Image Link": url})
-                    prog.progress(int(i/len(to_process)*100))
-                    df_map = pd.DataFrame(results, columns=["File","Product","Image Link"])
-                    st.success(f"Uploaded {df_map['Image Link'].astype(bool).sum()} / {len(df_map)} images.")
-                    st.dataframe(df_map, use_container_width=True)
-                    
-                    out_xlsx = io.BytesIO()
-                    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
-                        df_map.to_excel(w, sheet_name="Links", index=False)
-                        st.download_button("⬇️ Download mapping (XLSX)", data=out_xlsx.getvalue(),
-                                           file_name="folder_links.xlsx",
-                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-                        out_csv = df_map.to_csv(index=False).encode("utf-8")
-                        st.download_button("⬇️ Download mapping (CSV)", data=out_csv,
-                                           file_name="folder_links.csv", mime="text/csv")
 
-# Footer with your name/company
+                results.append({"File": label, "Product": clean_filename(label), "Image Link": url})
+                prog.progress(int(i/total*100))
+
+            df_map = pd.DataFrame(results, columns=["File","Product","Image Link"])
+            st.success(f"Uploaded {df_map['Image Link'].astype(bool).sum()} / {len(df_map)} images.")
+            st.dataframe(df_map, use_container_width=True)
+
+            out_xlsx = io.BytesIO()
+            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+                df_map.to_excel(w, sheet_name="Links", index=False)
+            st.download_button(
+                "⬇️ Download mapping (XLSX)",
+                data=out_xlsx.getvalue(),
+                file_name="folder_links.xlsx",
+                mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet"
+            )
+
+            out_csv = df_map.to_csv(index=False).encode("utf-8")
+            st.download_button(
+                "⬇️ Download mapping (CSV)",
+                data=out_csv,
+                file_name="folder_links.csv",
+                mime="text/csv"
+            )
+
+
+# Footer
 year = datetime.datetime.now().year
 footer_company = (f' · <a href="{COMPANY_URL}" target="_blank"> {COMPANY_NAME}</a>'
                   if COMPANY_URL else f" · {COMPANY_NAME}" if COMPANY_NAME else "")
