@@ -134,6 +134,12 @@ def clean_filename(s: str) -> str:
     s = s.replace("..", ".")
     return (s[:140] or "image")
 
+# 🔥 ADD THIS DIRECTLY HERE
+def generate_upload_folder() -> str:
+    ts = datetime.datetime.utcnow().strftime("%Y%m%d_%H%M%S")
+    rand = os.urandom(3).hex()  # 6 chars
+    return f"{ts}_{rand}"
+    
 def extract_url_from_cell(text: str) -> Optional[str]:
     if not text:
         return None
@@ -204,16 +210,19 @@ def upload_bytes_to_s3(data: bytes, filename: str) -> str:
     s3 = st.session_state["S3"]
     bucket = st.secrets["S3_BUCKET"]
 
-    # We force the public URL format the user gave:
-    # https://static.ora.ma/streamlit/<file_name>
-    prefix = "streamlit"
-    key = f"{prefix}/{filename}".replace("\\", "/")
+    # 🔥 SAME FOLDER FOR THE WHOLE SESSION (LIKE OLD SCRIPT)
+    if "UPLOAD_FOLDER" not in st.session_state:
+        st.session_state["UPLOAD_FOLDER"] = generate_upload_folder()
+
+    folder = st.session_state["UPLOAD_FOLDER"]
+
+    key = f"streamlit/{folder}/{filename}".replace("\\", "/")
 
     s3.put_object(
         Bucket=bucket,
         Key=key,
         Body=data,
-        ContentType=_guess_content_type(filename),
+        ContentType="image/jpeg" if filename.lower().endswith(".jpg") else "image/png",
     )
 
     return f"https://static.ora.ma/{key}"
