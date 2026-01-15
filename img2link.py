@@ -155,6 +155,59 @@ def upload_bytes_to_s3(data: bytes, filename: str) -> str:
 
     base = st.secrets["S3_PUBLIC_BASE"].rstrip("/")
     return f"{base}/{key}"
+# ── Missing helpers (REQUIRED)
+# ───────────────────────────────────────────────────────────────────────────────
+
+def clean_filename(s: str) -> str:
+    s = (s or "image").strip()
+    s = re.sub(r'[\\/:*?"<>|]+', "_", s)
+    s = re.sub(r"\s+", " ", s)
+    return s[:120] or "image"
+
+
+def extract_url_from_cell(text: str) -> Optional[str]:
+    if not text:
+        return None
+    m = re.search(r"(https?://[^\s\"'>]+)", text)
+    return m.group(1) if m else None
+
+
+def auto_detect_columns(df: pd.DataFrame,
+                        name_hint: Optional[str],
+                        img_hint: Optional[str]) -> Tuple[int, int]:
+    cols = [str(c).lower() for c in df.columns]
+
+    name_idx = None
+    img_idx = None
+
+    if name_hint:
+        for i, c in enumerate(cols):
+            if name_hint.lower() in c:
+                name_idx = i
+                break
+
+    if img_hint:
+        for i, c in enumerate(cols):
+            if img_hint.lower() in c:
+                img_idx = i
+                break
+
+    if name_idx is None:
+        for i, c in enumerate(cols):
+            if any(k in c for k in ["name", "product", "title", "libelle"]):
+                name_idx = i
+                break
+
+    if img_idx is None:
+        for i, c in enumerate(cols):
+            if any(k in c for k in ["image", "img", "photo", "picture", "url"]):
+                img_idx = i
+                break
+
+    if name_idx is None or img_idx is None:
+        raise ValueError("Could not auto-detect product/image columns")
+
+    return name_idx, img_idx
 
 # 4) XLSX drawing XML mapping (strict / any-col / smart)
 # ───────────────────────────────────────────────────────────────────────────────
@@ -661,24 +714,26 @@ with tab_images:
             for i, (label, raw) in enumerate(to_process, 1):
                 processed, ext = process_image_bytes(raw, bg_mode, up_mode, up_w, up_h)
                 fname = clean_filename(label) + ext
-                try: url = upload_bytes_to_cloudinary(processed, fname)
-                except Exception as e: url = ""; st.error(f"Upload failed for {label}: {e}")
-                results.append({"File": label, "Product": clean_filename(label), "Image Link": url})
-                prog.progress(int(i/len(to_process)*100))
-
-            df_map = pd.DataFrame(results, columns=["File","Product","Image Link"])
-            st.success(f"Uploaded {df_map['Image Link'].astype(bool).sum()} / {len(df_map)} images.")
-            st.dataframe(df_map, use_container_width=True)
-
-            out_xlsx = io.BytesIO()
-            with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
-                df_map.to_excel(w, sheet_name="Links", index=False)
-            st.download_button("⬇️ Download mapping (XLSX)", data=out_xlsx.getvalue(),
-                               file_name="folder_links.xlsx",
-                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
-            out_csv = df_map.to_csv(index=False).encode("utf-8")
-            st.download_button("⬇️ Download mapping (CSV)", data=out_csv,
-                               file_name="folder_links.csv", mime="text/csv")
+                try:
+                    url = upload_bytes_to_s3(processed, fname)
+                except Exception as e:
+                    url = ""
+                    st.error(f"Upload failed for {label}: {e}")
+                    results.append({"File": label, "Product": clean_filename(label), "Image Link": url})
+                    prog.progress(int(i/len(to_process)*100))
+                    df_map = pd.DataFrame(results, columns=["File","Product","Image Link"])
+                    st.success(f"Uploaded {df_map['Image Link'].astype(bool).sum()} / {len(df_map)} images.")
+                    st.dataframe(df_map, use_container_width=True)
+                    
+                    out_xlsx = io.BytesIO()
+                    with pd.ExcelWriter(out_xlsx, engine="openpyxl") as w:
+                        df_map.to_excel(w, sheet_name="Links", index=False)
+                        st.download_button("⬇️ Download mapping (XLSX)", data=out_xlsx.getvalue(),
+                                           file_name="folder_links.xlsx",
+                                           mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+                        out_csv = df_map.to_csv(index=False).encode("utf-8")
+                        st.download_button("⬇️ Download mapping (CSV)", data=out_csv,
+                                           file_name="folder_links.csv", mime="text/csv")
 
 # Footer with your name/company
 year = datetime.datetime.now().year
