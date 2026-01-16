@@ -129,10 +129,17 @@ st.markdown(f"""
 
 def clean_filename(s: str) -> str:
     s = (s or "image").strip()
-    s = re.sub(r'[\\/:*?"<>|]+', "_", s)
-    s = re.sub(r"\s+", " ", s).strip()
-    s = s.replace("..", ".")
-    return (s[:140] or "image")
+
+    # replace spaces with underscore
+    s = s.replace(" ", "_")
+
+    # remove forbidden characters
+    s = re.sub(r'[\\/:*?"<>|]+', "", s)
+
+    # keep only safe characters
+    s = re.sub(r"[^A-Za-z0-9._-]", "", s)
+
+    return s[:120] or "image"
 
 # 🔥 ADD THIS DIRECTLY HERE
 def generate_upload_folder() -> str:
