@@ -116,7 +116,7 @@ st.markdown(f"""
 <div class="brand-row">
   {logo_html}
   <div>
-    <div class="brand-title">Image → Link Converter</div>
+    <div class="brand-title">But Why...!</div>
     <div class="brand-by">by <strong>{AUTHOR_NAME}</strong>{company_html}</div>
   </div>
 </div>
