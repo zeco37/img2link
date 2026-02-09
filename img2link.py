@@ -16,7 +16,7 @@ AUTHOR_NAME  = "Zakaria Belalioui"
 COMPANY_NAME = "Ora Technologies"
 COMPANY_URL  = "https://www.kooul.ma/"
 LOGO_SOURCE  = "assets/attachment-clip-page-paper-icon-vector-design-png_117669.jpg"
-BACKGROUND_URL = "https://static.ora.ma/streamlit/20260209_140947_a437b8/ChatGPT_Image_9_fvr._2026_15_09_16.jpg"
+BACKGROUND_URL = "https://static.ora.ma/streamlit/20260209_140947_a437b8/Capture_dcran_2026_02_09_151102.jpg"
 
 
 # 2) Page, favicon, background & CSS
