@@ -47,7 +47,7 @@ def _data_uri_from_source(src: str) -> Optional[str]:
 
 ICON = _pil_icon_from_source(LOGO_SOURCE)
 st.set_page_config(
-    page_title="Image 2 Link",
+    page_title="But Why...!",
     page_icon=ICON if ICON else "🔗",
     layout="centered",
 )
